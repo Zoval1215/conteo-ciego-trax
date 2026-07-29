@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: conteo-ciego-trax
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: CONTEO_OPEN_BROWSER
+        value: "0"
+      - key: CONTEO_DATA_DIR
+        value: /var/data
+      - key: CONTEO_BACKUP_DIR
+        value: /var/data/backups
+    disk:
+      name: conteo-ciego-data
+      mountPath: /var/data
+      sizeGB: 1

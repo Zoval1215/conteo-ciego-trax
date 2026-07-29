@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY . /app
+
+ENV CONTEO_HOST=0.0.0.0
+ENV CONTEO_OPEN_BROWSER=0
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 10000
+
+CMD ["python", "server.py"]
