@@ -1,4 +1,4 @@
-const CACHE_NAME='conteo-ciego-pwa-v1.39';
+const CACHE_NAME='conteo-ciego-pwa-v1.40';
 
 const APP_SHELL=[
   '/',

@@ -1240,7 +1240,7 @@ def create_backup(
             json.dumps(
                 {
                     "format": "CONTEO_CIEGO_POSTGRES_BACKUP",
-                    "version": "1.39",
+                    "version": "1.40",
                     "exportedAt": utc_now(),
                     "users": users,
                     "authSessions": auth_sessions,
@@ -1299,7 +1299,7 @@ class ApiError(Exception):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ConteoCiegoPWA/1.39"
+    server_version = "ConteoCiegoPWA/1.40"
 
     def log_message(
         self,
@@ -1601,7 +1601,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "mode": "central",
-                    "version": "1.39",
+                    "version": "1.40",
                     "database": (
                         "postgres"
                         if USE_POSTGRES
@@ -2195,7 +2195,7 @@ def main() -> None:
     )
 
     print("=" * 62)
-    print("CONTEO CIEGO PWA CLOUD v1.39")
+    print("CONTEO CIEGO PWA CLOUD v1.40")
     print("=" * 62)
     print(f"En esta computadora: {local_url}")
     print(f"En la red local:      {lan_url}")
