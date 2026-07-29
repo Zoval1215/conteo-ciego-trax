@@ -46,6 +46,7 @@ ROLE_MANAGER = "MANAGER"
 ROLE_COUNTER = "COUNTER"
 PBKDF2_ITERATIONS = 210_000
 MAX_BODY_BYTES = 120 * 1024 * 1024
+MAX_BULK_RECORDS = 5000
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -519,6 +520,146 @@ def save_record(
     return response_key
 
 
+def save_records_bulk(
+    store: str,
+    values: Any,
+    *,
+    allow_auto: bool,
+) -> list[Any]:
+    require_store(store)
+
+    if not isinstance(values, list):
+        raise ValueError(
+            "La carga masiva debe contener una lista de registros."
+        )
+
+    if len(values) > MAX_BULK_RECORDS:
+        raise ValueError(
+            f"Cada paquete admite hasta {MAX_BULK_RECORDS} registros."
+        )
+
+    if not values:
+        return []
+
+    key_field = ALLOWED_STORES[store]
+    response_keys: list[Any] = []
+    prepared_rows: list[tuple[str, str, str, str]] = []
+    stamp = utc_now()
+
+    with DB_LOCK:
+        try:
+            CONN.execute("BEGIN IMMEDIATE")
+
+            next_id = 1
+
+            if store in AUTO_STORES:
+                sequence = CONN.execute(
+                    "SELECT next_id FROM sequences WHERE store = ?",
+                    (store,),
+                ).fetchone()
+                next_id = (
+                    int(sequence["next_id"])
+                    if sequence
+                    else 1
+                )
+
+            for raw_value in values:
+                if not isinstance(raw_value, dict):
+                    raise ValueError(
+                        "Todos los registros del paquete deben ser objetos JSON."
+                    )
+
+                value = json.loads(
+                    json.dumps(
+                        raw_value,
+                        ensure_ascii=False,
+                    )
+                )
+                key = value.get(key_field)
+
+                if store in AUTO_STORES:
+                    if key is None or key == "":
+                        if not allow_auto:
+                            raise ValueError(
+                                f"El registro requiere el campo {key_field}."
+                            )
+                        numeric_key = next_id
+                        next_id += 1
+                    else:
+                        try:
+                            numeric_key = int(key)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                f"El campo {key_field} debe ser numérico."
+                            ) from exc
+                        next_id = max(
+                            next_id,
+                            numeric_key + 1,
+                        )
+
+                    value[key_field] = numeric_key
+                    key_text = str(numeric_key)
+                    response_key: Any = numeric_key
+                else:
+                    if key is None or key == "":
+                        raise ValueError(
+                            f"El registro requiere el campo {key_field}."
+                        )
+
+                    response_key = str(key)
+                    value[key_field] = response_key
+                    key_text = response_key
+
+                prepared_rows.append(
+                    (
+                        store,
+                        key_text,
+                        json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        stamp,
+                    )
+                )
+                response_keys.append(response_key)
+
+            CONN.executemany(
+                """
+                INSERT INTO records(
+                    store,
+                    record_key,
+                    value_json,
+                    updated_at
+                )
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(store, record_key)
+                DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                prepared_rows,
+            )
+
+            if store in AUTO_STORES:
+                CONN.execute(
+                    """
+                    INSERT INTO sequences(store, next_id)
+                    VALUES(?, ?)
+                    ON CONFLICT(store)
+                    DO UPDATE SET next_id = excluded.next_id
+                    """,
+                    (store, next_id),
+                )
+
+            CONN.commit()
+        except Exception:
+            CONN.rollback()
+            raise
+
+    return response_keys
+
+
 def list_records(store: str) -> list[dict[str, Any]]:
     require_store(store)
     order_sql = (
@@ -659,7 +800,7 @@ class ApiError(Exception):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ConteoCiegoPWA/1.35"
+    server_version = "ConteoCiegoPWA/1.37"
 
     def log_message(
         self,
@@ -1347,6 +1488,38 @@ class Handler(BaseHTTPRequestHandler):
         if (
             len(parts) == 3
             and parts[0] == "store"
+            and parts[2] == "bulk"
+        ):
+            self.authenticated_user()
+            payload = self.read_json()
+            mode = str(
+                payload.get("mode") or "put"
+            ).lower()
+
+            if mode not in {"put", "add"}:
+                raise ValueError(
+                    "El modo masivo debe ser put o add."
+                )
+
+            keys = save_records_bulk(
+                parts[1],
+                payload.get("values"),
+                allow_auto=(
+                    mode == "add"
+                    or parts[1] in AUTO_STORES
+                ),
+            )
+            self.send_json(
+                {
+                    "count": len(keys),
+                    "keys": keys,
+                }
+            )
+            return
+
+        if (
+            len(parts) == 3
+            and parts[0] == "store"
             and parts[2] in {
                 "put",
                 "add",
@@ -1506,7 +1679,7 @@ def main() -> None:
     )
 
     print("=" * 62)
-    print("CONTEO CIEGO PWA CLOUD v1.36")
+    print("CONTEO CIEGO PWA CLOUD v1.37")
     print("=" * 62)
     print(f"En esta computadora: {local_url}")
     print(f"En la red local:      {lan_url}")
