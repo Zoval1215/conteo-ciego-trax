@@ -961,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "mode": "central",
-                    "version": "1.35",
+                    "version": "1.36",
                 }
             )
             return
@@ -1506,7 +1506,7 @@ def main() -> None:
     )
 
     print("=" * 62)
-    print("CONTEO CIEGO PWA CLOUD v1.35")
+    print("CONTEO CIEGO PWA CLOUD v1.36")
     print("=" * 62)
     print(f"En esta computadora: {local_url}")
     print(f"En la red local:      {lan_url}")
