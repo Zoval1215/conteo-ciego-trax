@@ -2,7 +2,7 @@ services:
   - type: web
     name: conteo-ciego-trax
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     envVars:
@@ -12,7 +12,3 @@ services:
         value: /var/data
       - key: CONTEO_BACKUP_DIR
         value: /var/data/backups
-    disk:
-      name: conteo-ciego-data
-      mountPath: /var/data
-      sizeGB: 1
