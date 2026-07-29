@@ -6,6 +6,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -14,6 +15,13 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 from datetime import datetime, timedelta, timezone
@@ -25,6 +33,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("CONTEO_DATA_DIR", BASE_DIR / "data"))
 BACKUP_DIR = Path(os.environ.get("CONTEO_BACKUP_DIR", BASE_DIR / "backups"))
 DB_PATH = DATA_DIR / "conteo_ciego.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
 HTML_PATH = BASE_DIR / "ABRIR_CONTEO_CIEGO.html"
 
 HOST = os.environ.get("CONTEO_HOST", "0.0.0.0")
@@ -52,8 +62,133 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_LOCK = threading.RLock()
-CONN = sqlite3.connect(DB_PATH, check_same_thread=False)
-CONN.row_factory = sqlite3.Row
+
+
+class DatabaseConnection:
+    def __init__(self) -> None:
+        self.kind = "postgres" if USE_POSTGRES else "sqlite"
+        self.connection = self._connect()
+
+    def _connect(self):
+        if self.kind == "postgres":
+            if psycopg is None:
+                raise RuntimeError(
+                    "Falta instalar psycopg para usar PostgreSQL."
+                )
+
+            return psycopg.connect(
+                DATABASE_URL,
+                row_factory=dict_row,
+            )
+
+        connection = sqlite3.connect(
+            DB_PATH,
+            check_same_thread=False,
+        )
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_connection(self) -> None:
+        if self.kind == "postgres":
+            if self.connection.closed:
+                self.connection = self._connect()
+        else:
+            try:
+                self.connection.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                self.connection = self._connect()
+
+    def _translate_sql(self, sql: str) -> str:
+        if self.kind != "postgres":
+            return sql
+
+        translated = sql.replace(
+            "BEGIN IMMEDIATE",
+            "BEGIN",
+        )
+        translated = re.sub(
+            r"MAX\(\s*sequences\.next_id\s*,\s*excluded\.next_id\s*\)",
+            "GREATEST(sequences.next_id, excluded.next_id)",
+            translated,
+            flags=re.IGNORECASE,
+        )
+        translated = translated.replace("?", "%s")
+        return translated
+
+    def execute(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...] | list[Any] = (),
+    ):
+        self._ensure_connection()
+        return self.connection.execute(
+            self._translate_sql(sql),
+            parameters,
+        )
+
+    def executemany(
+        self,
+        sql: str,
+        parameters,
+    ):
+        self._ensure_connection()
+        cursor = self.connection.cursor()
+        cursor.executemany(
+            self._translate_sql(sql),
+            parameters,
+        )
+        return cursor
+
+    def executescript(self, script: str) -> None:
+        self._ensure_connection()
+
+        if self.kind == "sqlite":
+            self.connection.executescript(script)
+            return
+
+        cleaned = "\n".join(
+            line
+            for line in script.splitlines()
+            if not line.strip().upper().startswith("PRAGMA ")
+        )
+
+        for statement in cleaned.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.connection.execute(
+                    self._translate_sql(statement)
+                )
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        self.connection.rollback()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def backup_to(self, destination: Path) -> None:
+        if self.kind != "sqlite":
+            raise RuntimeError(
+                "La copia binaria solo está disponible con SQLite."
+            )
+
+        backup_connection = sqlite3.connect(destination)
+        try:
+            self.connection.backup(backup_connection)
+        finally:
+            backup_connection.close()
+
+
+CONN = DatabaseConnection()
+
+INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+
+if psycopg is not None:
+    INTEGRITY_ERRORS = INTEGRITY_ERRORS + (
+        psycopg.IntegrityError,
+    )
 
 
 def utc_now() -> str:
@@ -64,7 +199,7 @@ def parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def public_user(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def public_user(row: dict[str, Any] | Any) -> dict[str, Any]:
     return {
         "id": row["id"],
         "username": row["username"],
@@ -271,7 +406,7 @@ def revoke_user_sessions(username: str) -> None:
         CONN.commit()
 
 
-def user_from_token(token: str) -> sqlite3.Row | None:
+def user_from_token(token: str) -> dict[str, Any] | Any | None:
     cleanup_sessions()
     token_hash = hashlib.sha256(
         token.encode("utf-8")
@@ -294,7 +429,7 @@ def user_from_token(token: str) -> sqlite3.Row | None:
     return row
 
 
-def get_user(username: str) -> sqlite3.Row | None:
+def get_user(username: str) -> dict[str, Any] | Any | None:
     with DB_LOCK:
         return CONN.execute(
             "SELECT * FROM users WHERE username = ?",
@@ -309,7 +444,7 @@ def create_user(
     password: Any,
     role: str,
     created_by: str,
-) -> sqlite3.Row:
+) -> dict[str, Any] | Any:
     clean_name = str(display_name or "").strip()
 
     if len(clean_name) < 3:
@@ -355,7 +490,7 @@ def create_user(
                 ),
             )
             CONN.commit()
-        except sqlite3.IntegrityError as exc:
+        except INTEGRITY_ERRORS as exc:
             raise ValueError(
                 "Ese nombre de usuario ya está registrado."
             ) from exc
@@ -660,6 +795,304 @@ def save_records_bulk(
     return response_keys
 
 
+
+def save_round_count(
+    payload: dict[str, Any],
+    user: dict[str, Any] | Any,
+) -> dict[str, Any]:
+    try:
+        session_id = int(payload.get("sessionId"))
+        item_id = int(payload.get("itemId"))
+        round_no = int(payload.get("roundNo"))
+        quantity = float(payload.get("qty"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Los datos del conteo no son válidos."
+        ) from exc
+
+    if round_no not in {1, 2}:
+        raise ValueError(
+            "La ronda indicada no es válida."
+        )
+
+    if quantity < 0:
+        raise ValueError(
+            "La cantidad no puede ser negativa."
+        )
+
+    part_no = str(payload.get("partNo") or "").strip()
+    family = str(payload.get("family") or "").strip()
+    location_correct = payload.get("locationCorrect")
+    source_ids = payload.get("sourceItemIds") or [item_id]
+
+    if not part_no:
+        raise ValueError(
+            "Falta el número de parte."
+        )
+
+    if not family:
+        raise ValueError(
+            "Falta la familia."
+        )
+
+    if not isinstance(location_correct, bool):
+        raise ValueError(
+            "Falta validar la ubicación."
+        )
+
+    if not isinstance(source_ids, list) or not source_ids:
+        source_ids = [item_id]
+
+    if len(source_ids) > 2000:
+        raise ValueError(
+            "El número de ubicaciones relacionadas es demasiado grande."
+        )
+
+    normalized_source_ids: list[int] = []
+
+    for source_id in source_ids:
+        try:
+            normalized_source_ids.append(int(source_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Existe un identificador de ubicación inválido."
+            ) from exc
+
+    stamp = utc_now()
+    count_key = f"{session_id}:{item_id}:{round_no}"
+    audit_user = {
+        "userId": user["id"],
+        "username": user["username"],
+        "displayName": user["display_name"],
+        "role": user["role"],
+    }
+
+    with DB_LOCK:
+        try:
+            CONN.execute("BEGIN IMMEDIATE")
+
+            session_row = CONN.execute(
+                """
+                SELECT value_json
+                FROM records
+                WHERE store = ?
+                  AND record_key = ?
+                """,
+                ("sessions", str(session_id)),
+            ).fetchone()
+
+            if session_row is None:
+                raise ValueError(
+                    "No se encontró el folio."
+                )
+
+            session_value = json.loads(
+                session_row["value_json"]
+            )
+
+            if session_value.get("status") != f"ROUND{round_no}":
+                raise ValueError(
+                    "La ronda ya no está activa."
+                )
+
+            existing_row = CONN.execute(
+                """
+                SELECT value_json
+                FROM records
+                WHERE store = ?
+                  AND record_key = ?
+                """,
+                ("counts", count_key),
+            ).fetchone()
+
+            if existing_row is not None:
+                existing = json.loads(
+                    existing_row["value_json"]
+                )
+
+                if (
+                    float(existing.get("qty", 0)) == quantity
+                    and existing.get("locationCorrect")
+                    is location_correct
+                ):
+                    CONN.commit()
+                    return existing
+
+                raise ValueError(
+                    "Este número de parte ya fue registrado. "
+                    "Utilice Modificar para cambiarlo."
+                )
+
+            item_rows: list[tuple[str, str, str, str]] = []
+
+            for source_id in normalized_source_ids:
+                source_row = CONN.execute(
+                    """
+                    SELECT value_json
+                    FROM records
+                    WHERE store = ?
+                      AND record_key = ?
+                    """,
+                    ("items", str(source_id)),
+                ).fetchone()
+
+                if source_row is None:
+                    continue
+
+                source = json.loads(
+                    source_row["value_json"]
+                )
+
+                if (
+                    int(source.get("sessionId", -1))
+                    != session_id
+                    or str(source.get("partNo", ""))
+                    != part_no
+                ):
+                    raise ValueError(
+                        "El número de parte no corresponde al folio."
+                    )
+
+                source["family"] = family
+                item_rows.append(
+                    (
+                        "items",
+                        str(source_id),
+                        json.dumps(
+                            source,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        stamp,
+                    )
+                )
+
+            if not item_rows:
+                raise ValueError(
+                    "No se encontró el artículo del conteo."
+                )
+
+            CONN.executemany(
+                """
+                INSERT INTO records(
+                    store,
+                    record_key,
+                    value_json,
+                    updated_at
+                )
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(store, record_key)
+                DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                item_rows,
+            )
+
+            count_record = {
+                "key": count_key,
+                "sessionId": session_id,
+                "itemId": item_id,
+                "partNo": part_no,
+                "countMode": (
+                    session_value.get("countMode")
+                    or "LOCATION"
+                ),
+                "roundNo": round_no,
+                "qty": quantity,
+                "locationCorrect": location_correct,
+                "locationCheckedAt": stamp,
+                "countedAt": stamp,
+                "countedBy": audit_user,
+            }
+
+            CONN.execute(
+                """
+                INSERT INTO records(
+                    store,
+                    record_key,
+                    value_json,
+                    updated_at
+                )
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(store, record_key)
+                DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    "counts",
+                    count_key,
+                    json.dumps(
+                        count_record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    stamp,
+                ),
+            )
+
+            master_row = CONN.execute(
+                """
+                SELECT value_json
+                FROM records
+                WHERE store = ?
+                  AND record_key = ?
+                """,
+                ("partMaster", part_no),
+            ).fetchone()
+
+            old_master = (
+                json.loads(master_row["value_json"])
+                if master_row
+                else {}
+            )
+            unit_cost = payload.get("unitCost")
+
+            if unit_cost is None:
+                unit_cost = old_master.get("unitCost")
+
+            master = {
+                "partNo": part_no,
+                "family": family,
+                "unitCost": unit_cost,
+                "updatedAt": stamp,
+            }
+
+            CONN.execute(
+                """
+                INSERT INTO records(
+                    store,
+                    record_key,
+                    value_json,
+                    updated_at
+                )
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(store, record_key)
+                DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    "partMaster",
+                    part_no,
+                    json.dumps(
+                        master,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    stamp,
+                ),
+            )
+
+            CONN.commit()
+            return count_record
+
+        except Exception:
+            CONN.rollback()
+            raise
+
+
 def list_records(store: str) -> list[dict[str, Any]]:
     require_store(store)
     order_sql = (
@@ -754,31 +1187,97 @@ def create_backup(
     stamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
     )
-    destination = (
-        BACKUP_DIR
-        / f"{prefix}_{stamp}.db"
-    )
 
-    with DB_LOCK:
-        backup_conn = sqlite3.connect(destination)
-        try:
-            CONN.backup(backup_conn)
-        finally:
-            backup_conn.close()
+    if USE_POSTGRES:
+        destination = (
+            BACKUP_DIR
+            / f"{prefix}_{stamp}.json"
+        )
+
+        with DB_LOCK:
+            users = [
+                dict(row)
+                for row in CONN.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    ORDER BY username
+                    """
+                ).fetchall()
+            ]
+            auth_sessions = [
+                dict(row)
+                for row in CONN.execute(
+                    """
+                    SELECT *
+                    FROM auth_sessions
+                    ORDER BY created_at
+                    """
+                ).fetchall()
+            ]
+            records = [
+                dict(row)
+                for row in CONN.execute(
+                    """
+                    SELECT *
+                    FROM records
+                    ORDER BY store, record_key
+                    """
+                ).fetchall()
+            ]
+            sequences = [
+                dict(row)
+                for row in CONN.execute(
+                    """
+                    SELECT *
+                    FROM sequences
+                    ORDER BY store
+                    """
+                ).fetchall()
+            ]
+
+        destination.write_text(
+            json.dumps(
+                {
+                    "format": "CONTEO_CIEGO_POSTGRES_BACKUP",
+                    "version": "1.39",
+                    "exportedAt": utc_now(),
+                    "users": users,
+                    "authSessions": auth_sessions,
+                    "records": records,
+                    "sequences": sequences,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    else:
+        destination = (
+            BACKUP_DIR
+            / f"{prefix}_{stamp}.db"
+        )
+
+        with DB_LOCK:
+            CONN.backup_to(destination)
 
     backups = sorted(
-        BACKUP_DIR.glob("*.db"),
+        BACKUP_DIR.glob("*"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
 
     for old in backups[30:]:
-        old.unlink(missing_ok=True)
+        if old.is_file():
+            old.unlink(missing_ok=True)
 
     return destination
 
 
 def automatic_startup_backup() -> None:
+    if USE_POSTGRES:
+        return
+
     try:
         if DB_PATH.exists() and DB_PATH.stat().st_size:
             create_backup(prefix="automatico")
@@ -800,7 +1299,7 @@ class ApiError(Exception):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ConteoCiegoPWA/1.37"
+    server_version = "ConteoCiegoPWA/1.39"
 
     def log_message(
         self,
@@ -938,7 +1437,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return token
 
-    def authenticated_user(self) -> sqlite3.Row:
+    def authenticated_user(self) -> dict[str, Any] | Any:
         user = user_from_token(
             self.bearer_token()
         )
@@ -951,7 +1450,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return user
 
-    def manager_user(self) -> sqlite3.Row:
+    def manager_user(self) -> dict[str, Any] | Any:
         user = self.authenticated_user()
 
         if user["role"] != ROLE_MANAGER:
@@ -1102,7 +1601,12 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "mode": "central",
-                    "version": "1.36",
+                    "version": "1.39",
+                    "database": (
+                        "postgres"
+                        if USE_POSTGRES
+                        else "sqlite"
+                    ),
                 }
             )
             return
@@ -1485,6 +1989,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
+        if parts == ["rounds", "save-count"]:
+            user = self.authenticated_user()
+            payload = self.read_json()
+            count = save_round_count(
+                payload,
+                user,
+            )
+            self.send_json(
+                {"count": count}
+            )
+            return
+
         if (
             len(parts) == 3
             and parts[0] == "store"
@@ -1679,11 +2195,18 @@ def main() -> None:
     )
 
     print("=" * 62)
-    print("CONTEO CIEGO PWA CLOUD v1.37")
+    print("CONTEO CIEGO PWA CLOUD v1.39")
     print("=" * 62)
     print(f"En esta computadora: {local_url}")
     print(f"En la red local:      {lan_url}")
-    print(f"Base de datos:        {DB_PATH}")
+    print(
+        "Base de datos:        "
+        + (
+            "PostgreSQL central"
+            if USE_POSTGRES
+            else str(DB_PATH)
+        )
+    )
     print("Mantenga esta ventana abierta mientras se utilice el sistema.")
     print("Para detener el servidor presione Ctrl+C.")
     print("=" * 62)
